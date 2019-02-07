@@ -286,7 +286,7 @@ dmdAnal' env dmd (Case scrut case_bndr ty alts)
 -- This is used for a non-recursive local let without manifest lambdas.
 -- This is the LetUp rule in the paper “Higher-Order Cardinality Analysis”.
 dmdAnal' env dmd (Let (NonRec id rhs) body)
-  | useLetUp id rhs
+  | useLetUp id
   , Nothing <- unpackTrivial rhs
       -- dmdAnalRhsLetDown treats trivial right hand sides specially
       -- so if we have a trival right hand side, fall through to that.
@@ -683,19 +683,22 @@ unpackTrivial (Lam v e) | isTyVar v   = unpackTrivial e
 unpackTrivial (App e a) | isTypeArg a = unpackTrivial e
 unpackTrivial _                       = Nothing
 
--- | If given the RHS of a let-binding, this 'useLetUp' determines
--- whether we should process the binding up (body before rhs) or
--- down (rhs before body).
+-- | If given the let-bound 'Id', 'useLetUp' determines whether we should
+-- process the binding up (body before rhs) or down (rhs before body).
 --
 -- We use LetDown if there is a chance to get a useful strictness signature.
--- This is the case when there are manifest value lambdas or the binding is a
--- join point (hence always acts like a function, not a value).
-useLetUp :: Var -> CoreExpr -> Bool
-useLetUp f _         | isJoinId f = False
-useLetUp f (Lam v e) | isTyVar v  = useLetUp f e
-useLetUp _ (Lam _ _)              = False
-useLetUp _ _                      = True
-
+-- This is the case when it takes any arguments before performing meaningful
+-- work (cf. 'idArity') or the binding is a join point (hence always acts like a
+-- function, not a value).
+--
+-- Thus, if the binding is not a join point and its arity is 0, we use LetUp.
+-- In that case, it's a thunk and we want to unleash its 'DmdEnv' of free vars
+-- at most once, regardless of how many times it was forced in the body. This
+-- makes a real difference wrt. usage demands. The other reason is being able to
+-- unleash a more precise product demand on its RHS once we know how the thunk
+-- was used in the let body.
+useLetUp :: Var -> Bool
+useLetUp f = idArity f == 0 && not (isJoinId f)
 
 {- Note [Demand analysis for join points]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
