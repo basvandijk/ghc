@@ -634,13 +634,14 @@ dmdAnalRhsLetDown top_lvl rec_flag env let_dmd id rhs
                    -> (bndrs, body, let_dmd)
 
            Nothing | (bndrs, body) <- collectBinders rhs
-                   -> (bndrs, body, mkBodyDmd env body)
+                   , let body_arity = max (idArity id - length bndrs) 0
+                   -> (bndrs, body, mkBodyDmd env body_arity body)
 
     env_body         = foldl' extendSigsWithLam env bndrs
     (body_ty, body') = dmdAnal env_body body_dmd body
-    body_ty'         = removeDmdTyArgs body_ty -- zap possible deep CPR info
-    (DmdType rhs_fv rhs_dmds rhs_res, bndrs')
-                     = annotateLamBndrs env (isDFunId id) body_ty' bndrs
+    (rhs_ty, bndrs') = annotateLamBndrs env (isDFunId id) body_ty bndrs
+    DmdType rhs_fv rhs_dmds rhs_res
+                     = ensureArgs (idArity id) rhs_ty -- zap possible deep CPR info
     sig_ty           = mkStrictSig (mkDmdType sig_fv rhs_dmds rhs_res')
     id'              = set_idStrictness env id sig_ty
         -- See Note [NOINLINE and strictness]
@@ -666,10 +667,14 @@ dmdAnalRhsLetDown top_lvl rec_flag env let_dmd id rhs
        || not (isStrictDmd (idDemandInfo id) || ae_virgin env)
           -- See Note [Optimistic CPR in the "virgin" case]
 
-mkBodyDmd :: AnalEnv -> CoreExpr -> CleanDemand
+-- | Creates a 'CleanDemand' appropriate for unleashing on the given function
+-- body, by wrapping a head demand into @arity@ many calls.
 -- See Note [Product demands for function body]
-mkBodyDmd env body
-  = case deepSplitProductType_maybe (ae_fam_envs env) (exprType body) of
+mkBodyDmd :: AnalEnv -> Arity -> CoreExpr -> CleanDemand
+mkBodyDmd env arity body
+  = iterate mkCallDmd base !! arity
+  where
+    base = case deepSplitProductType_maybe (ae_fam_envs env) (exprType body) of
        Nothing            -> cleanEvalDmd
        Just (dc, _, _, _) -> cleanEvalProdDmd (dataConRepArity dc)
 
