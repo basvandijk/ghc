@@ -18,11 +18,14 @@ of libtool across differet platforms.
 module Ar
   (ArchiveEntry(..)
   ,Archive(..)
+  ,ArchiveOrScript(..)
+  ,LinkerScript(..)
+  ,LibName
   ,afilter
 
   ,parseAr
 
-  ,loadAr
+  ,loadArchiveOrScript
   ,loadObj
   ,writeBSDAr
   ,writeGNUAr
@@ -43,6 +46,7 @@ import Control.Applicative
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Char8 as C
 import qualified Data.ByteString.Lazy as L
+import qualified Text.ParserCombinators.ReadP as R
 #if !defined(mingw32_HOST_OS)
 import qualified System.Posix.Files as POSIX
 #endif
@@ -228,6 +232,68 @@ putGNUArch (Archive as) = do
     processEntries =
       uncurry (:) . mapAccumL processEntry (ArchiveEntry "//" 0 0 0 0 0 mempty)
 
+-- | Some systems have archives that are not really archives but contain so
+-- called linker scripts. These scripts contain textual commands to the
+-- linker. This data type represents this choice between an actual archive or
+-- implicit linker script.
+--
+-- See: https://sourceware.org/binutils/docs/ld/Implicit-Linker-Scripts.html#Implicit-Linker-Scripts
+data ArchiveOrScript = Ar Archive | ImplicitLinkerScript LinkerScript
+                       deriving (Eq, Show)
+
+-- | An AST for a linker script.
+--
+-- At the moment this AST only supports linker scripts of the form:
+--
+-- @INPUT(-lc++_static -lc++abi)@
+--
+-- Since this is exactly what is used in @nixpkgs@ for @libc++.a@.
+--
+-- For more information on linker scripts see:
+-- https://sourceware.org/binutils/docs/ld/Scripts.html
+data LinkerScript = INPUT [LibName]
+                    deriving (Eq, Show)
+
+-- | Name of a library to link with.
+--
+-- This is everything after the @-l@ prefix.
+type LibName = String
+
+linkerScriptReadP :: R.ReadP LinkerScript
+linkerScriptReadP = skipSpaceChars *> inputReadP <* R.skipSpaces
+  where
+    inputReadP :: R.ReadP LinkerScript
+    inputReadP = fmap INPUT $ R.between (symbol "INPUT(") (symbol ")") $
+                   R.sepBy libReadP sep <* skipSpaceChars
+      where
+        libReadP :: R.ReadP LibName
+        libReadP = R.string "-l" *> R.many1 (R.satisfy isLibNameChar)
+          where
+            isLibNameChar c = c /= ')' && c /= ',' && c /= ' '
+
+        sep :: R.ReadP ()
+        sep = R.char ' ' *> skipSpaceChars
+
+        symbol :: String -> R.ReadP ()
+        symbol str = R.string str *> skipSpaceChars
+
+    skipSpaceChars :: R.ReadP ()
+    skipSpaceChars = do
+        s <- R.look
+        skip s
+      where
+        skip (' ':s) = do _ <- R.get; skip s
+        skip _       = do return ()
+
+parseArOrScript :: B.ByteString -> Either (ByteOffset, String) ArchiveOrScript
+parseArOrScript bs =
+    case runGetOrFail getArch $ L.fromChunks $ pure bs of
+      Left (_, pos, msg) ->
+        case R.readP_to_S linkerScriptReadP $ C.unpack bs of
+          [(linkerScript, "")] -> Right $ ImplicitLinkerScript linkerScript
+          _ -> Left (pos, msg)
+      Right (_, _, ar) -> Right $ Ar ar
+
 parseAr :: B.ByteString -> Archive
 parseAr = runGet getArch . L.fromChunks . pure
 
@@ -235,8 +301,17 @@ writeBSDAr, writeGNUAr :: FilePath -> Archive -> IO ()
 writeBSDAr fp = L.writeFile fp . runPut . putBSDArch
 writeGNUAr fp = L.writeFile fp . runPut . putGNUArch
 
-loadAr :: FilePath -> IO Archive
-loadAr fp = parseAr <$> B.readFile fp
+loadArchiveOrScript :: FilePath -> IO ArchiveOrScript
+loadArchiveOrScript fp = do
+  bs <- B.readFile fp
+  case parseArOrScript bs of
+    Left (pos, msg) ->
+      error $
+        "Error while decoding archive: " <> fp <>
+        " is neither an archive because decoding failed at position " <>
+        show pos <> " with error " <> msg <>
+        ", nor is it an implicit linker script!"
+    Right arOrScript -> return arOrScript
 
 loadObj :: FilePath -> IO ArchiveEntry
 loadObj fp = do

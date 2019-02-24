@@ -2016,11 +2016,10 @@ linkStaticLib dflags o_files dep_packages = do
   (when output_exists) $ removeFile full_output_fn
 
   pkg_cfgs <- getPreloadPackagesAnd dflags dep_packages
-  archives <- concat <$> mapM (collectArchives dflags) pkg_cfgs
 
-  ar <- foldl mappend
-        <$> (Archive <$> mapM loadObj modules)
-        <*> mapM loadAr archives
+  arFromArchives <- mconcat <$> mapM (loadArchives dflags) pkg_cfgs
+  arFromObjects <- Archive <$> mapM loadObj modules
+  let ar = arFromObjects `mappend` arFromArchives
 
   if sLdIsGnuLd (settings dflags)
     then writeGNUAr output_fn $ afilter (not . isGNUSymdef) ar
@@ -2028,6 +2027,22 @@ linkStaticLib dflags o_files dep_packages = do
 
   -- run ranlib over the archive. write*Ar does *not* create the symbol index.
   runRanlib dflags [SysTools.FileOption "" output_fn]
+
+loadArchives :: DynFlags -> PackageConfig -> IO Archive
+loadArchives dflags pc = loadArchivesFromLibs libs
+  where
+    libs = packageHsLibs dflags pc ++ extraLibraries pc
+
+    loadArchivesFromLibs :: [LibName] -> IO Archive
+    loadArchivesFromLibs libs = do
+      arPaths <- collectArchivesFromLibs dflags pc libs
+      fmap mconcat $ forM arPaths $ \arPath -> do
+        arOrScript <- loadArchiveOrScript arPath
+        case arOrScript of
+          Ar ar -> return ar
+          ImplicitLinkerScript linkerScript ->
+            case linkerScript of
+              INPUT libNames -> loadArchivesFromLibs libNames
 
 -- -----------------------------------------------------------------------------
 -- Running CPP
